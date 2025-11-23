@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="yolo-detect-desktop/yolo-detect-desktop.vcxproj" Id="f48494c0-4e79-46ee-a390-8f36a1bc9e64" />
+</Solution>
