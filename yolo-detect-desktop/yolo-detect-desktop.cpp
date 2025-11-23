@@ -3,7 +3,7 @@
 
 #include "framework.h"
 #include "yolo-detect-desktop.h"
-
+#include <filesystem>
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
 #include <array>
@@ -40,7 +40,7 @@ static int g_imgWidth = 0;
 static int g_imgHeight = 0;
 static HBITMAP g_hBaseBmp = nullptr; // 原始图像 HBITMAP (用于 StretchBlt)
 
-static std::wstring g_modelPath = L"C:/Users/33554/Documents/learn/zixue/cpp23/ConsoleApplication1/x64/Release/yolo11x.onnx";
+static std::wstring g_modelPath;
 
 // ====== YOLO 类别名称 ======
 static const std::array<std::string, 80> kClassNames = {
@@ -63,6 +63,30 @@ static void RunYoloDetection(const std::string& image_path);
 static std::string OpenImageFileDialog(HWND hWnd);
 static void UpdateScrollBars(HWND hWnd);
 static void ClampScroll();
+
+// 获取 exe 目录
+static std::wstring GetExeDir() {
+    wchar_t buf[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0) return L"";
+    std::wstring full(buf, len);
+    size_t pos = full.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) full = full.substr(0, pos);
+    return full;
+}
+
+// 自动寻找第一个 .onnx
+static std::wstring AutoFindOnnx(const std::wstring& modelDir) {
+    WIN32_FIND_DATAW fd;
+    std::wstring pattern = modelDir + L"\\*.onnx";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        std::wstring path = modelDir + L"\\" + fd.cFileName;
+        FindClose(h);
+        return path;
+    }
+    return L"";
+}
 
 // ====== 工具: 排序 (按置信度) ======
 static void sortVecs(std::vector<std::vector<float>>& preds, size_t confIdx) {
@@ -160,6 +184,10 @@ static std::string OpenImageFileDialog(HWND hWnd) {
 // ====== YOLO 推理入口 ======
 static void RunYoloDetection(const std::string& image_path) {
 	if (image_path.empty()) return;
+    if (!std::filesystem::exists(g_modelPath)) {
+        std::wcerr << L"模型文件不存在: " << g_modelPath << std::endl;
+        return;
+    }
 	int input_w = 640;
 	int input_h = 640;
 	const float conf_thresh = 0.4f;
@@ -349,6 +377,25 @@ ATOM MyRegisterClass(HINSTANCE hInstance) {
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     hInst = hInstance;
 
+    // 动态设置模型路径（若尚未设置）
+    if (g_modelPath.empty()) {
+        std::wstring exeDir = GetExeDir();
+        std::wstring modelDir = exeDir + L"\\model";
+        std::wstring defaultPath = modelDir + L"\\yolo11x.onnx";
+        if (std::filesystem::exists(defaultPath)) {
+            g_modelPath = defaultPath;
+        }
+        else {
+            std::wstring autoPath = AutoFindOnnx(modelDir);
+            if (!autoPath.empty()) {
+                g_modelPath = autoPath;
+            }
+            else {
+                g_modelPath = defaultPath; // 仍设为默认，后续 RunYoloDetection 会报错
+            }
+        }
+    }
+
     // 窗口样式（保留滚动条）
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_HSCROLL | WS_VSCROLL;
 
@@ -478,44 +525,63 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         InvalidateRect(hWnd,nullptr,FALSE);
     } break;
     case WM_PAINT: {
-        PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd,&ps);
-        RECT rcClient; GetClientRect(hWnd,&rcClient);
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rcClient; GetClientRect(hWnd, &rcClient);
         int clientW = rcClient.right - rcClient.left;
         int clientH = rcClient.bottom - rcClient.top;
         SetStretchBltMode(hdc, HALFTONE);
 
-        if(g_hBaseBmp && !g_img.empty()){
+        if (g_hBaseBmp && !g_img.empty()) {
             HDC memDC = CreateCompatibleDC(hdc);
             HGDIOBJ old = SelectObject(memDC, g_hBaseBmp);
-            int srcX = (int)(g_scrollX / g_zoom);
-            int srcY = (int)(g_scrollY / g_zoom);
-            int srcW = (int)(clientW / g_zoom);
-            int srcH = (int)(clientH / g_zoom); // 边界裁剪
 
-            if(srcX + srcW > g_imgWidth) srcW = g_imgWidth - srcX;
-            if(srcY + srcH > g_imgHeight) srcH = g_imgHeight - srcY;
+            // 统一策略：永远把选定源区域拉伸到整个客户区；滚动始终可用
+            double z = g_zoom;
+            int srcX = (int)(g_scrollX / z);
+            int srcY = (int)(g_scrollY / z);
+            int srcW = (int)std::ceil(clientW / z);
+            int srcH = (int)std::ceil(clientH / z);
 
-            StretchBlt(hdc, 0,0, clientW, clientH, memDC, srcX, srcY, srcW, srcH, SRCCOPY);
+            // 边界裁剪：若到边缘，只缩小源区域，同时保持拉伸到 client -> scaleX/scaleY 变化
+            if (srcX + srcW > g_imgWidth)  srcW = g_imgWidth - srcX;
+            if (srcY + srcH > g_imgHeight) srcH = g_imgHeight - srcY;
+            if (srcW <= 0 || srcH <= 0) { srcW = srcH = 0; }
+
+            int destX = 0, destY = 0;
+            int destW = clientW;
+            int destH = clientH;
+
+            // 实际缩放因子（可能 != g_zoom，特别是触边裁剪时）
+            double scaleX = (srcW > 0) ? (double)destW / (double)srcW : 1.0;
+            double scaleY = (srcH > 0) ? (double)destH / (double)srcH : 1.0;
+
+            if (srcW > 0 && srcH > 0) {
+                StretchBlt(hdc, destX, destY, destW, destH, memDC, srcX, srcY, srcW, srcH, SRCCOPY);
+            }
+
             SelectObject(memDC, old);
             DeleteDC(memDC);
 
-            // 绘制检测框与标签（按缩放重新计算）
-            if(!g_detections.empty()){
-                double z = g_zoom;
-                HFONT hFont = NULL;
-                int fontPx = (int)(12 * z);
-                if(fontPx<8) fontPx=8;
-                LOGFONTW lf{}; lf.lfHeight = -fontPx; lstrcpyW(lf.lfFaceName, L"Segoe UI"); hFont = CreateFontIndirectW(&lf);
+            // 绘制检测框（使用实际 scaleX/scaleY）
+            if (!g_detections.empty() && srcW > 0 && srcH > 0) {
+                int fontPx = (int)(12 * ((scaleX + scaleY) * 0.5));
+                if (fontPx < 8) fontPx = 8;
+                LOGFONTW lf{}; lf.lfHeight = -fontPx; lstrcpyW(lf.lfFaceName, L"Segoe UI");
+                HFONT hFont = CreateFontIndirectW(&lf);
                 HGDIOBJ oldFont = SelectObject(hdc, hFont);
-                for(auto &d: g_detections){
-                    // 判断是否在当前视口
-                    double x1s = d.x1 * z - g_scrollX;
-                    double y1s = d.y1 * z - g_scrollY;
-                    double x2s = d.x2 * z - g_scrollX;
-                    double y2s = d.y2 * z - g_scrollY;
-                    if(x2s<0 || y2s<0 || x1s>clientW || y1s>clientH) continue;
-                    RECT box{ (LONG)std::lround(x1s), (LONG)std::lround(y1s), (LONG)std::lround(x2s), (LONG)std::lround(y2s)}; // 框线宽度随缩放
-                    HPEN pen = CreatePen(PS_SOLID, (int)std::clamp(z,1.0,5.0), RGB(255,0,0));
+
+                for (auto& d : g_detections) {
+                    // 映射：先减去源起点，再乘缩放
+                    double x1s = (d.x1 - srcX) * scaleX + destX;
+                    double y1s = (d.y1 - srcY) * scaleY + destY;
+                    double x2s = (d.x2 - srcX) * scaleX + destX;
+                    double y2s = (d.y2 - srcY) * scaleY + destY;
+                    if (x2s < 0 || y2s < 0 || x1s > clientW || y1s > clientH) continue;
+
+                    RECT box{ (LONG)std::lround(x1s), (LONG)std::lround(y1s),
+                              (LONG)std::lround(x2s), (LONG)std::lround(y2s) };
+                    int penW = (int)std::clamp((scaleX + scaleY) * 0.5, 1.0, 5.0);
+                    HPEN pen = CreatePen(PS_SOLID, penW, RGB(255, 0, 0));
                     HGDIOBJ oldPen = SelectObject(hdc, pen);
                     HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
                     Rectangle(hdc, box.left, box.top, box.right, box.bottom);
@@ -525,16 +591,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
                     std::string label = std::format("{} {:.2f}", kClassNames[d.cls], d.conf);
                     std::wstring wlabel(label.begin(), label.end());
-                    SIZE sz;
-                    GetTextExtentPoint32W(hdc, wlabel.c_str(), (int)wlabel.size(), &sz);
+                    SIZE sz; GetTextExtentPoint32W(hdc, wlabel.c_str(), (int)wlabel.size(), &sz);
                     int pad = 2;
-                    RECT bg{box.left, box.top - sz.cy - pad*2, box.left + sz.cx + pad*2, box.top};
-                    if(bg.top < 0){
-                        bg.top = box.top;
-                        bg.bottom = box.top + sz.cy + pad*2;
-                    }
-                    HBRUSH hbr = CreateSolidBrush(RGB(255,255,0));
-                    FillRect(hdc,&bg,hbr);
+                    RECT bg{ box.left, box.top - sz.cy - pad * 2, box.left + sz.cx + pad * 2, box.top };
+                    if (bg.top < 0) { bg.top = box.top; bg.bottom = box.top + sz.cy + pad * 2; }
+                    HBRUSH hbr = CreateSolidBrush(RGB(255, 255, 0));
+                    FillRect(hdc, &bg, hbr);
                     DeleteObject(hbr);
                     SetBkMode(hdc, TRANSPARENT);
                     TextOutW(hdc, bg.left + pad, bg.top + pad, wlabel.c_str(), (int)wlabel.size());
@@ -542,11 +604,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 SelectObject(hdc, oldFont);
                 DeleteObject(hFont);
             }
-        } else {
-            // 修复 C6385: TextOutW 的字符数应为字符串实际长度
+        }
+        else {
             TextOutW(hdc, 10, 10, L"选择图片", 4);
         }
-        EndPaint(hWnd,&ps);
+        EndPaint(hWnd, &ps);
     } break;
     case WM_DESTROY:
         if(g_hBaseBmp){ DeleteObject(g_hBaseBmp); g_hBaseBmp=nullptr; }
