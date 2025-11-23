@@ -210,9 +210,16 @@ static void RunYoloDetection(const std::string& image_path) {
 		session_options.SetIntraOpNumThreads(1);
 		session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
-		OrtCUDAProviderOptions cuda_options;
-		cuda_options.device_id = 0;
-		session_options.AppendExecutionProvider_CUDA(cuda_options);
+		bool cuda_ok = false;
+		try {
+			OrtCUDAProviderOptions cuda_options;
+			cuda_options.device_id = 0;
+			session_options.AppendExecutionProvider_CUDA(cuda_options);
+			cuda_ok = true;
+		} catch (const Ort::Exception&) {
+			// CUDA 不可用，继续用 CPU
+			cuda_ok = false;
+		}
 
 		Ort::Session session(env, g_modelPath.c_str(), session_options);
 		Ort::AllocatorWithDefaultOptions allocator;
