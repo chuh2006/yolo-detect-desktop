@@ -15,11 +15,25 @@
 #include <algorithm>
 #include <iostream>
 #include <commdlg.h>
+#include <windows.h> // ensure Windows types/macros
+#include <windowsx.h> // GET_X_LPARAM, GET_Y_LPARAM
+#ifndef GET_X_LPARAM
+#define GET_X_LPARAM(lp) ((int)(short)LOWORD(lp))
+#endif
+#ifndef GET_Y_LPARAM
+#define GET_Y_LPARAM(lp) ((int)(short)HIWORD(lp))
+#endif
 
 #define MAX_LOADSTRING 100
 
 #ifndef IDM_OPEN
 #define IDM_OPEN  32771 // 定义“打开图片”菜单命令 ID
+#endif
+#ifndef IDM_SAVE_CROP
+#define IDM_SAVE_CROP 32772 // 保存裁剪
+#endif
+#ifndef IDM_SHOW_CROP
+#define IDM_SHOW_CROP 32773 // 显示裁剪
 #endif
 
 // 全局变量:
@@ -31,6 +45,7 @@ WCHAR szWindowClass[MAX_LOADSTRING];            // 主窗口类名
 static cv::Mat g_img;               // 原始图像 (BGR)
 struct Detection { float x1,y1,x2,y2,conf; int cls; };
 static std::vector<Detection> g_detections; // 检测框列表
+static int g_selectedIdx = -1;              // 当前选中的检测框索引
 
 // 显示相关
 static double g_zoom = 1.0;         // 缩放比
@@ -58,11 +73,15 @@ static const std::array<std::string, 80> kClassNames = {
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
-INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
+INT_PTR CALLBACK    AboutDlgProc(HWND, UINT, WPARAM, LPARAM); // rename from About
 static void RunYoloDetection(const std::string& image_path);
 static std::string OpenImageFileDialog(HWND hWnd);
+static std::string SaveImageFileDialog(HWND hWnd);
 static void UpdateScrollBars(HWND hWnd);
 static void ClampScroll();
+static void SelectDetectionAtPoint(int clientX, int clientY, HWND hWnd);
+static void ShowSelectedCrop();
+static void SaveSelectedCrop(HWND hWnd);
 
 // 获取 exe 目录
 static std::wstring GetExeDir() {
@@ -138,13 +157,17 @@ static HBITMAP MatToHBITMAP(const cv::Mat& mat) {
     if (mat.empty()) return nullptr;
     cv::Mat bgr;
     if (mat.channels() == 3) {
-        bgr = mat.clone(); // 我们的可视化目前是 BGR->RGB 之后绘制的，转回 BGR 以符合常见顺序
+        bgr = mat.clone(); // 我们的可视化目前是 BGR->RGB 之后绘制的，转回 RGB 以符合常见顺序
     } else if (mat.channels() == 4) {
         cv::cvtColor(mat, bgr, cv::COLOR_BGRA2BGR);
     } else {
         cv::cvtColor(mat, bgr, cv::COLOR_GRAY2BGR);
     }
 
+    int width = bgr.cols;
+    int height = bgr.rows;
+    int bitCount = 24;
+    int stride = ((width * bitCount + 31) / 32) * 4; // DWORD 对齐
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = bgr.cols;
@@ -152,14 +175,20 @@ static HBITMAP MatToHBITMAP(const cv::Mat& mat) {
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 24;
     bmi.bmiHeader.biCompression = BI_RGB;
+    bmi.bmiHeader.biSizeImage = stride * height;
 
     void* bits = nullptr;
     HDC hdc = GetDC(nullptr);
     HBITMAP hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (hBitmap && bits) {
-        size_t lineSize = (size_t)bgr.cols * 3;
-        for (int y = 0; y < bgr.rows; ++y) {
-            memcpy(static_cast<unsigned char*>(bits) + y * lineSize, bgr.ptr(y), lineSize);
+        int srcLine = width * 3;
+        for (int y = 0; y < height; ++y) {
+            BYTE* dst = static_cast<BYTE*>(bits) + y * stride;
+            const BYTE* src = bgr.ptr(y);
+            memcpy(dst, src, srcLine);
+            if (stride > srcLine) {
+                memset(dst + srcLine, 0, stride - srcLine); // 填充 padding
+            }
         }
     }
     ReleaseDC(nullptr, hdc);
@@ -179,6 +208,26 @@ static std::string OpenImageFileDialog(HWND hWnd) {
 	ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_EXPLORER;
 	if (GetOpenFileNameA(&ofn)) return std::string(fileName);
 	return {};
+}
+
+// 文件保存对话框 (PNG)
+static std::string SaveImageFileDialog(HWND hWnd) {
+    char fileName[MAX_PATH] = { 0 };
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hWnd;
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = "PNG Image\0*.png\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_EXPLORER;
+    if (GetSaveFileNameA(&ofn)) {
+        std::string path(fileName);
+        // 自动补 .png
+        if (path.find_last_of('.') == std::string::npos) path += ".png";
+        return path;
+    }
+    return {};
 }
 
 // ====== YOLO 推理入口 ======
@@ -455,8 +504,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 InvalidateRect(hWnd,nullptr,TRUE);
             }
         } break;
+        case IDM_SAVE_CROP: {
+            SaveSelectedCrop(hWnd);
+        } break;
+        case IDM_SHOW_CROP: {
+            ShowSelectedCrop();
+        } break;
         case IDM_ABOUT:
-            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, AboutDlgProc);
             break;
         case IDM_EXIT:
             DestroyWindow(hWnd);
@@ -471,6 +526,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             RunYoloDetection(path);
             UpdateScrollBars(hWnd);
             InvalidateRect(hWnd,nullptr,TRUE);
+        }
+    } break;
+    case WM_LBUTTONDOWN: {
+        int x = (int)(short)LOWORD(lParam);
+        int y = (int)(short)HIWORD(lParam);
+        SelectDetectionAtPoint(x, y, hWnd);
+        InvalidateRect(hWnd, nullptr, FALSE);
+    } break;
+    case WM_RBUTTONUP: {
+        int x = (int)(short)LOWORD(lParam);
+        int y = (int)(short)HIWORD(lParam);
+        // 右键选择并弹出菜单
+        SelectDetectionAtPoint(x, y, hWnd);
+        if (g_selectedIdx >= 0) {
+            HMENU hPopup = CreatePopupMenu();
+            AppendMenuW(hPopup, MF_STRING, IDM_SAVE_CROP, L"保存裁剪(&S)");
+            AppendMenuW(hPopup, MF_STRING, IDM_SHOW_CROP, L"预览裁剪(&V)");
+            POINT pt{ x, y }; ClientToScreen(hWnd, &pt);
+            TrackPopupMenu(hPopup, TPM_RIGHTBUTTON | TPM_LEFTALIGN, pt.x, pt.y, 0, hWnd, nullptr);
+            DestroyMenu(hPopup);
+            InvalidateRect(hWnd, nullptr, FALSE);
         }
     } break;
     case WM_SIZE: {
@@ -577,8 +653,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 HFONT hFont = CreateFontIndirectW(&lf);
                 HGDIOBJ oldFont = SelectObject(hdc, hFont);
 
-                for (auto& d : g_detections) {
-                    // 映射：先减去源起点，再乘缩放
+                for (size_t iDet = 0; iDet < g_detections.size(); ++iDet) {
+                    auto& d = g_detections[iDet];
                     double x1s = (d.x1 - srcX) * scaleX + destX;
                     double y1s = (d.y1 - srcY) * scaleY + destY;
                     double x2s = (d.x2 - srcX) * scaleX + destX;
@@ -588,7 +664,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     RECT box{ (LONG)std::lround(x1s), (LONG)std::lround(y1s),
                               (LONG)std::lround(x2s), (LONG)std::lround(y2s) };
                     int penW = (int)std::clamp((scaleX + scaleY) * 0.5, 1.0, 5.0);
-                    HPEN pen = CreatePen(PS_SOLID, penW, RGB(255, 0, 0));
+                    COLORREF color = (int)iDet == g_selectedIdx ? RGB(0,255,0) : RGB(255,0,0);
+                    HPEN pen = CreatePen(PS_SOLID, penW, color);
                     HGDIOBJ oldPen = SelectObject(hdc, pen);
                     HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
                     Rectangle(hdc, box.left, box.top, box.right, box.bottom);
@@ -597,12 +674,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     DeleteObject(pen);
 
                     std::string label = std::format("{} {:.2f}", kClassNames[d.cls], d.conf);
+                    if ((int)iDet == g_selectedIdx) label = std::string("[") + label + "]"; // 标记选择
                     std::wstring wlabel(label.begin(), label.end());
                     SIZE sz; GetTextExtentPoint32W(hdc, wlabel.c_str(), (int)wlabel.size(), &sz);
                     int pad = 2;
                     RECT bg{ box.left, box.top - sz.cy - pad * 2, box.left + sz.cx + pad * 2, box.top };
                     if (bg.top < 0) { bg.top = box.top; bg.bottom = box.top + sz.cy + pad * 2; }
-                    HBRUSH hbr = CreateSolidBrush(RGB(255, 255, 0));
+                    HBRUSH hbr = CreateSolidBrush(color == RGB(0,255,0) ? RGB(0,128,0) : RGB(255,255,0));
                     FillRect(hdc, &bg, hbr);
                     DeleteObject(hbr);
                     SetBkMode(hdc, TRANSPARENT);
@@ -627,7 +705,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     return 0;
 }
 
-INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+INT_PTR CALLBACK AboutDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
     UNREFERENCED_PARAMETER(lParam);
     switch (message) {
     case WM_INITDIALOG:
@@ -640,4 +718,73 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
         break;
     }
     return (INT_PTR)FALSE;
+}
+
+// 命中测试: 将 client 坐标映射到原始图像坐标并选择检测框
+static void SelectDetectionAtPoint(int clientX, int clientY, HWND hWnd) {
+    if (g_img.empty()) return;
+    RECT rcClient; GetClientRect(hWnd, &rcClient);
+    int clientW = rcClient.right - rcClient.left;
+    int clientH = rcClient.bottom - rcClient.top;
+    double z = g_zoom;
+    int srcX = (int)(g_scrollX / z);
+    int srcY = (int)(g_scrollY / z);
+    int srcW = (int)std::ceil(clientW / z);
+    int srcH = (int)std::ceil(clientH / z);
+    if (srcX + srcW > g_imgWidth)  srcW = g_imgWidth - srcX;
+    if (srcY + srcH > g_imgHeight) srcH = g_imgHeight - srcY;
+    if (srcW <= 0 || srcH <= 0) return;
+    double scaleX = (srcW > 0) ? (double)clientW / (double)srcW : 1.0;
+    double scaleY = (srcH > 0) ? (double)clientH / (double)srcH : 1.0;
+    // 反向映射
+    double imgX = srcX + (clientX / scaleX);
+    double imgY = srcY + (clientY / scaleY);
+
+    int bestIdx = -1;
+    double bestArea = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < g_detections.size(); ++i) {
+        auto& d = g_detections[i];
+        if (imgX >= d.x1 && imgX <= d.x2 && imgY >= d.y1 && imgY <= d.y2) {
+            double area = (d.x2 - d.x1) * (d.y2 - d.y1);
+            if (area < bestArea) { // 选更小的框，避免重叠时选到大框
+                bestArea = area;
+                bestIdx = (int)i;
+            }
+        }
+    }
+    g_selectedIdx = bestIdx;
+}
+
+static void ShowSelectedCrop() {
+    if (g_selectedIdx < 0 || g_selectedIdx >= (int)g_detections.size()) return;
+    auto& d = g_detections[g_selectedIdx];
+    int x1 = (int)std::clamp(d.x1, 0.f, (float)g_imgWidth - 1);
+    int y1 = (int)std::clamp(d.y1, 0.f, (float)g_imgHeight - 1);
+    int x2 = (int)std::clamp(d.x2, 0.f, (float)g_imgWidth - 1);
+    int y2 = (int)std::clamp(d.y2, 0.f, (float)g_imgHeight - 1);
+    if (x2 <= x1 || y2 <= y1) return;
+    cv::Rect roi(x1, y1, x2 - x1, y2 - y1);
+    cv::Mat crop = g_img(roi).clone();
+    cv::imshow("CropPreview", crop); // 简单显示
+    cv::waitKey(1);
+}
+
+static void SaveSelectedCrop(HWND hWnd) {
+    if (g_selectedIdx < 0 || g_selectedIdx >= (int)g_detections.size()) return;
+    auto& d = g_detections[g_selectedIdx];
+    int x1 = (int)std::clamp(d.x1, 0.f, (float)g_imgWidth - 1);
+    int y1 = (int)std::clamp(d.y1, 0.f, (float)g_imgHeight - 1);
+    int x2 = (int)std::clamp(d.x2, 0.f, (float)g_imgWidth - 1);
+    int y2 = (int)std::clamp(d.y2, 0.f, (float)g_imgHeight - 1);
+    if (x2 <= x1 || y2 <= y1) return;
+    cv::Rect roi(x1, y1, x2 - x1, y2 - y1);
+    cv::Mat crop = g_img(roi).clone();
+    auto savePath = SaveImageFileDialog(hWnd);
+    if (!savePath.empty()) {
+        if (cv::imwrite(savePath, crop)) {
+            std::cout << "裁剪已保存: " << savePath << std::endl;
+        } else {
+            std::cerr << "保存失败: " << savePath << std::endl;
+        }
+    }
 }
